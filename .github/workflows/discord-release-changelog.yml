@@ -234,4 +234,3 @@ jobs:
                   print(str(exc) if isinstance(exc, Stop) else 'Unexpected notification error; credential-bearing details omitted.')
                   raise SystemExit(1)
           PY
-
