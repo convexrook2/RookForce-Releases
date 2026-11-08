@@ -1,0 +1,237 @@
+name: Discord release changelog
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published release tag to announce or refresh
+        required: true
+        type: string
+      existing_message_id:
+        description: Optional existing webhook message to update instead of creating one
+        required: false
+        type: string
+      dry_run:
+        description: Validate without sending or changing delivery state
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: discord-changelog-${{ github.event.release.tag_name || inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  announce:
+    if: github.event_name == 'workflow_dispatch' || github.event.release.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      DISCORD_RELEASE_WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Post the complete changelog to Discord
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          """Post complete release notes through the repository's existing Discord webhook."""
+          import json
+          import os
+          import re
+          import time
+          from pathlib import Path
+          from urllib import error, parse, request
+          
+          CHANNEL = '1568771456773652500'
+          GUILD = '1527077873175892200'
+          PRODUCTS = {
+              'convexrook2/Rookline-Drive-Releases': ('Drive', 0xD9ED7A),
+              'convexrook2/RookForce-Releases': ('RookForce', 0x62E6F4),
+          }
+          
+          class Stop(RuntimeError):
+              pass
+          
+          class NoRedirect(request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+          
+          def api(url, method='GET', data=None, token=None):
+              headers = {'User-Agent': 'RookDrivingSuite-ReleaseNotes/1.0', 'Content-Type': 'application/json'}
+              if token:
+                  headers.update({'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json'})
+              body = None if data is None else json.dumps(data).encode('utf-8')
+              opener = request.build_opener(NoRedirect())
+              for attempt in range(3):
+                  try:
+                      with opener.open(request.Request(url, data=body, headers=headers, method=method), timeout=30) as response:
+                          return json.load(response)
+                  except error.HTTPError as exc:
+                      if exc.code == 429 and attempt < 2:
+                          try:
+                              delay = float(json.loads(exc.read()).get('retry_after', 1))
+                          except (ValueError, TypeError):
+                              delay = 1
+                          if 0 <= delay <= 15:
+                              time.sleep(delay)
+                              continue
+                      raise Stop(f'{method} request returned HTTP {exc.code}; endpoint and credentials omitted.') from None
+                  except (error.URLError, TimeoutError, ValueError):
+                      # An uncertain Discord POST must never be retried automatically.
+                      raise Stop(f'{method} request did not return a confirmed JSON result; inspect delivery before retrying.') from None
+          
+          def webhook_base(value):
+              url = parse.urlsplit(value)
+              match = re.fullmatch(r'(/api(?:/v\d+)?/webhooks/\d+/[A-Za-z0-9_.-]+)(?:/github)?', url.path)
+              if url.scheme != 'https' or url.hostname not in ('discord.com', 'discordapp.com') or not match:
+                  raise Stop('Invalid Discord webhook destination.')
+              if url.username or url.password or url.port not in (None, 443):
+                  raise Stop('Unexpected Discord webhook authority.')
+              return f'https://{url.hostname}{match.group(1)}'
+          
+          def split_text(text, limit=3600):
+              """Split without dropping characters; Discord limits count UTF-16 code units."""
+              parts = []
+              while text:
+                  size = 0
+                  end = 0
+                  for character in text:
+                      units = 2 if ord(character) > 0xFFFF else 1
+                      if size + units > limit:
+                          break
+                      size += units
+                      end += 1
+                  if not end:
+                      raise Stop('A note character exceeds the message budget.')
+                  if end < len(text):
+                      paragraph = text.rfind('\n', 0, end)
+                      if paragraph > end // 2:
+                          end = paragraph + 1
+                  parts.append(text[:end])
+                  text = text[end:]
+              return parts
+          
+          def payloads(repo, release):
+              product, color = PRODUCTS[repo]
+              tag = release['tag_name']
+              title = f'{product} {tag} · ' + ('Preview release' if release.get('prerelease') else 'Release notes')
+              if len(title.encode('utf-16-le')) // 2 > 230:
+                  raise Stop('Release tag needs a shorter presentation title before posting.')
+              notes = release.get('body') or 'No changelog was supplied for this release.'
+              links = [f"[Full release notes]({release['html_url']})"]
+              for asset in release.get('assets', []):
+                  name = asset['name'].replace('\\', '\\\\').replace('[', '\\[').replace(']', '\\]')
+                  links.append(f"[{name}]({asset['browser_download_url']})")
+              text = notes + '\n\n**Downloads & release page**\n' + '\n'.join(links)
+              chunks = split_text(text)
+              return [{'allowed_mentions': {'parse': []}, 'embeds': [{
+                  'title': title + (f' ({index + 1}/{len(chunks)})' if len(chunks) > 1 else ''),
+                  'description': chunk, 'color': color,
+                  'footer': {'text': 'ROOK DRIVING SUITE · ' + product.upper()},
+                  'timestamp': release['published_at'],
+              }]} for index, chunk in enumerate(chunks)]
+          
+          class Publisher:
+              def __init__(self, repo, token, webhook, call=api):
+                  if repo not in PRODUCTS:
+                      raise Stop('This workflow only owns the two named public release repositories.')
+                  if not token:
+                      raise Stop('GitHub workflow token is missing.')
+                  self.repo, self.token, self.webhook, self.call = repo, token, webhook_base(webhook), call
+                  self.root = 'https://api.github.com/repos/' + repo
+          
+              def gh(self, path, method='GET', data=None):
+                  return self.call(self.root + path, method, data, self.token)
+          
+              def discord(self, path='', method='GET', data=None):
+                  return self.call(self.webhook + path, method, data)
+          
+              def publish(self, event, dry_run=False, seed_id=''):
+                  metadata = self.discord()
+                  if str(metadata.get('channel_id')) != CHANNEL or str(metadata.get('guild_id')) != GUILD:
+                      raise Stop('Webhook is outside the authorised Discord server/channel.')
+                  if 'release' in event:
+                      release = self.gh('/releases/' + str(event['release']['id']))
+                  else:
+                      tag = event.get('inputs', {}).get('release_tag', '')
+                      if not tag:
+                          raise Stop('Select a published release tag.')
+                      release = self.gh('/releases/tags/' + parse.quote(tag, safe=''))
+                  if release.get('draft') or not release.get('published_at'):
+                      raise Stop('Drafts and unpublished releases cannot be announced.')
+                  if seed_id and not re.fullmatch(r'\d{15,22}', seed_id):
+                      raise Stop('Existing message ID is invalid.')
+                  messages = payloads(self.repo, release)
+                  commit = self.gh('/commits/' + parse.quote(release['tag_name'], safe=''))['sha']
+                  prefix = 'discord/changelog/' + str(release['id']) + '/'
+                  states = {}
+                  page = 1
+                  while True:
+                      batch = self.gh(f'/commits/{commit}/statuses?per_page=100&page={page}')
+                      for state in batch:
+                          context = state.get('context', '')
+                          if context.startswith(prefix) and context not in states:
+                              states[context] = state
+                      if len(batch) < 100:
+                          break
+                      page += 1
+                  if any(int(context[len(prefix):]) > len(messages) for context in states):
+                      raise Stop('Edited notes now have fewer parts; review existing extra posts before updating.')
+                  results = []
+                  for index, payload in enumerate(messages, 1):
+                      context = prefix + str(index)
+                      state = states.get(context)
+                      target = (state or {}).get('target_url') or ''
+                      match = re.fullmatch(r'https://discord\.com/channels/' + GUILD + '/' + CHANNEL + r'/(\d{15,22})', target)
+                      message_id = match.group(1) if match else (seed_id if index == 1 else '')
+                      if state and not message_id:
+                          raise Stop('A previous delivery is uncertain. Inspect Discord and supply its message ID; no duplicate sent.')
+                      if message_id:
+                          stored = self.discord('/messages/' + message_id)
+                          if str(stored.get('channel_id')) != CHANNEL or str(stored.get('webhook_id')) != str(metadata['id']):
+                              raise Stop('Existing message is not owned by this webhook and channel.')
+                      if dry_run:
+                          print(f'Dry run: {release["tag_name"]}, part {index}/{len(messages)}, {len(payload["embeds"][0]["description"])} characters; no writes.')
+                          continue
+                      self.gh('/statuses/' + commit, 'POST', {'state': 'pending', 'context': context,
+                          'description': 'Sending full changelog to Discord', 'target_url': target or None})
+                      response = self.discord('/messages/' + message_id if message_id else '?wait=true',
+                          'PATCH' if message_id else 'POST', payload)
+                      message_id = str(response.get('id', ''))
+                      if not re.fullmatch(r'\d{15,22}', message_id) or str(response.get('channel_id')) != CHANNEL:
+                          raise Stop('Discord did not confirm a message in the expected channel.')
+                      link = f'https://discord.com/channels/{GUILD}/{CHANNEL}/{message_id}'
+                      print(f'Confirmed Discord message: {link}', flush=True)
+                      self.gh('/statuses/' + commit, 'POST', {'state': 'success', 'context': context,
+                          'description': f'Full changelog part {index}/{len(messages)} delivered', 'target_url': link})
+                      stored = self.discord('/messages/' + message_id)
+                      if stored['embeds'][0]['description'] != payload['embeds'][0]['description']:
+                          raise Stop('Stored Discord text differs from the complete changelog.')
+                      results.append(link)
+                  return results
+          
+          def main():
+              event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text(encoding='utf-8'))
+              inputs = event.get('inputs', {})
+              dry = str(inputs.get('dry_run', 'false')).lower() == 'true'
+              publisher = Publisher(os.environ['GITHUB_REPOSITORY'], os.environ.get('GH_TOKEN', ''),
+                  os.environ.get('DISCORD_RELEASE_WEBHOOK', ''))
+              links = publisher.publish(event, dry, inputs.get('existing_message_id', ''))
+              summary = os.environ.get('GITHUB_STEP_SUMMARY')
+              if summary:
+                  with open(summary, 'a', encoding='utf-8') as output:
+                      output.write('## Discord release changelog\n' + ('Dry run only.\n' if dry else '\n'.join(links) + '\n'))
+          
+          if __name__ == '__main__':
+              try:
+                  main()
+              except Exception as exc:
+                  print(str(exc) if isinstance(exc, Stop) else 'Unexpected notification error; credential-bearing details omitted.')
+                  raise SystemExit(1)
+          PY
+
