@@ -125,6 +125,8 @@ jobs:
               notes = release.get('body') or 'No changelog was supplied for this release.'
               links = [f"[Full release notes]({release['html_url']})"]
               for asset in release.get('assets', []):
+                  if not asset['name'].lower().endswith('.exe'):
+                      continue
                   name = asset['name'].replace('\\', '\\\\').replace('[', '\\[').replace(']', '\\]')
                   links.append(f"[{name}]({asset['browser_download_url']})")
               text = notes + '\n\n**Downloads & release page**\n' + '\n'.join(links)
